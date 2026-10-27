@@ -1,5 +1,9 @@
 name: Update Store Data
 
+permissions:
+  contents: write
+  actions: write
+
 on:
   schedule:
     - cron: '0 6 * * *'  # Dagligt kl 06:00 UTC
@@ -11,7 +15,10 @@ jobs:
     
     steps:
     - uses: actions/checkout@v4
-
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+    
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
@@ -29,7 +36,52 @@ jobs:
     
     - name: Commit and push if changed
       run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+
+        # Configure git to use token for authentication
+        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+
+        # Check if there are any changes from npm run update
         git add stores*.json stores*.csv
-        git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update: $(date +'%Y-%m-%d %H:%M')" && git push)
+
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+
+        # Commit the changes
+        git commit -m "chore: update store data [skip ci]"
+
+        # Pull latest changes and rebase our commit on top
+        git pull --rebase origin main
+
+        # Push the changes
+        git push origin main
+
+    - name: Purge jsDelivr cache
+      if: success()
+      run: |
+        # jsDelivr kan stadig pege på den forrige commit lige efter push,
+        # så vi purger igen indtil CDN'et serverer samme fil som repoet
+        CDN="https://cdn.jsdelivr.net/gh/${{ github.repository }}@main"
+        PURGE="https://purge.jsdelivr.net/gh/${{ github.repository }}@main"
+        for attempt in 1 2 3 4 5 6 7 8 9 10; do
+          echo "🔄 Purging jsDelivr cache (forsøg $attempt)..."
+          for f in stores.min.json stores.json stores.csv; do
+            curl -s "$PURGE/$f" > /dev/null
+          done
+          sleep 15
+          if curl -sf "$CDN/stores.min.json" | cmp -s - stores.min.json; then
+            echo "✅ CDN serverer de nyeste data"
+            exit 0
+          fi
+        done
+        echo "::warning::jsDelivr serverer stadig gamle data efter 10 forsøg"
+
+    - name: Keep workflow alive
+      # GitHub deaktiverer planlagte workflows efter 60 dages inaktivitet i repoet
+      if: always()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh api -X PUT repos/${{ github.repository }}/actions/workflows/update.yml/enable
